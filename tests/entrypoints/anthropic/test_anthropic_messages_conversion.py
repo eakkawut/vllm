@@ -374,6 +374,27 @@ class TestToolResultContent:
         assert len(tool_msg) == 1
         assert tool_msg[0]["content"] == "line 1\nline 2"
 
+    def test_tool_result_with_tool_reference(self):
+        """One text tool message per call: templates (Qwen3.x) reject
+        non-text items in tool content, and an empty first message plus a
+        second one for the same call broke strict tool ordering."""
+        request = self._make_tool_result_request(
+            [
+                {"type": "text", "text": "Found 2 tools"},
+                {"type": "tool_reference", "tool_name": "list_files"},
+                {"type": "tool_reference", "name": "read_file"},
+            ]
+        )
+        result = _convert(request)
+
+        tool_msg = [m for m in result.messages if m["role"] == "tool"]
+        assert len(tool_msg) == 1
+        assert tool_msg[0]["content"] == (
+            "Found 2 tools
+[tool reference: list_files]
+[tool reference: read_file]"
+        )
+
     def test_tool_result_with_image(self):
         """Image in tool_result should produce a follow-up user message."""
         request = self._make_tool_result_request(
