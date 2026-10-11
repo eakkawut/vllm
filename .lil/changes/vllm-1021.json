@@ -1,0 +1,22 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1021",
+  "category": "fix",
+  "summary": "Anthropic Messages API keeps mid-conversation system messages in place instead of merging them into the system prompt",
+  "models": [
+    "DeepSeek-V4.1-Flash",
+    "DeepSeek-V4-Flash",
+    "DeepSeek-V4-Flash-Vision-Exp",
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required. Affects /v1/messages clients that send role: system messages inside messages, such as Claude Code system reminders.",
+  "details": [
+    "Every such message was merged into the leading system prompt, so each new reminder changed the start of the prompt and the cached prefix was lost: on a recorded DeepSeek-V4.1 Claude Code session only about 4% of the previous prompt stayed reusable after a reminder arrived.",
+    "They now stay in place: as system messages on DeepSeek-V4.1 and GLM-5.3-Flash, whose formats have them, and as user messages on Qwen3.8 and DeepSeek-V4, whose templates accept system only first."
+  ],
+  "pull_requests": [
+    1021
+  ],
+  "requires": []
+}
