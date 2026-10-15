@@ -1,0 +1,20 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "vllm-1030",
+  "category": "internal",
+  "summary": "Agent instructions require repository prose that is understandable without the development history",
+  "models": [
+    "all"
+  ],
+  "compatibility": "No runtime change.",
+  "details": [
+    "AGENTS.md gains a section on writing documentation, comments, commit and PR text from the repository's present state, with durable identifiers and without lifecycle labels or narrated history."
+  ],
+  "authors": [
+    "voipmonitor"
+  ],
+  "pull_requests": [
+    1030
+  ],
+  "requires": []
+}
