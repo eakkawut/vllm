@@ -3,7 +3,7 @@
 """Pydantic models for Anthropic API protocol"""
 
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -33,20 +33,64 @@ class AnthropicUsage(BaseModel):
     cache_read_input_tokens: int | None = None
 
 
+AnthropicBlockType = Literal[
+    "text",
+    "image",
+    "tool_use",
+    "tool_result",
+    "tool_reference",
+    "thinking",
+    "redacted_thinking",
+    "tool_addition",
+    "tool_removal",
+]
+
+
+def block_as_text(block: dict[str, Any]) -> str:
+    """Text for a content block the chat path has no other form for.
+
+    ``search_result`` and text ``document`` blocks keep their text; a binary
+    document (PDF) becomes a note that it was not shown, and any other block
+    type a note naming it. Failing the request instead would fail every later
+    request of the session too, since the block stays in the history.
+    """
+    kind = block.get("type")
+    title = block.get("title")
+    if kind == "search_result":
+        texts = [
+            c.get("text", "")
+            for c in block.get("content") or []
+            if isinstance(c, dict) and c.get("type") == "text"
+        ]
+        head = f"Search result: {title}\nSource: {block.get('source')}"
+        return "\n".join([head, *texts])
+    if kind == "document":
+        source = block.get("source") or {}
+        if source.get("type") == "text":
+            text = source.get("data", "")
+        elif source.get("type") == "content":
+            content = source.get("content")
+            text = (
+                content
+                if isinstance(content, str)
+                else "\n".join(
+                    c.get("text", "")
+                    for c in content or []
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+            )
+        else:
+            name = f" {title!r}" if title else ""
+            media = source.get("media_type") or source.get("type") or "unknown"
+            return f"[document{name} ({media}) not shown: this model reads text only]"
+        return f"Document: {title}\n{text}" if title else text
+    return f"[{kind} block omitted]"
+
+
 class AnthropicContentBlock(BaseModel):
     """Content block in message"""
 
-    type: Literal[
-        "text",
-        "image",
-        "tool_use",
-        "tool_result",
-        "tool_reference",
-        "thinking",
-        "redacted_thinking",
-        "tool_addition",
-        "tool_removal",
-    ]
+    type: AnthropicBlockType
     text: str | None = None
     # For image content
     source: dict[str, Any] | None = None
@@ -66,6 +110,17 @@ class AnthropicContentBlock(BaseModel):
     data: str | None = None
     # For tool_addition/tool_removal content
     tool: "AnthropicToolChange | None" = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def unsupported_block_as_text(cls, data: Any) -> Any:
+        """``document``, ``search_result``, server-tool and future block types
+        become text instead of failing validation (422)."""
+        if isinstance(data, dict) and data.get("type") not in get_args(
+            AnthropicBlockType
+        ):
+            return {"type": "text", "text": block_as_text(data)}
+        return data
 
     @model_validator(mode="after")
     def validate_tool_change(self) -> "AnthropicContentBlock":

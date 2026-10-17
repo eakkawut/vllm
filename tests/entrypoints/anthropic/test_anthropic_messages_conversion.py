@@ -1502,14 +1502,16 @@ class TestSystemBlockJoining:
         )
 
     def test_merged_inline_system_is_separated_from_top_level(self):
-        """Inline system merged into the top-level block (system-first
-        templates) is joined with a separator, not concatenated raw."""
+        """A leading system message merged into the top-level block
+        (system-first templates) is joined with a separator, not concatenated
+        raw. Later ones stay in place (TestInlineSystemForSystemFirstTemplates).
+        """
         request = _make_request(
             [
-                {"role": "system", "content": "...for Claude."},
-                {"role": "user", "content": "Hi"},
                 {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hi"},
             ],
+            system="...for Claude.",
         )
         result = _convert(request, merge_inline_system=True)
 
@@ -2032,11 +2034,11 @@ class TestInlineSystemForSystemFirstTemplates:
                     {"role": "system", "content": "First."},
                     {"role": "user", "content": "Hello"},
                 ],
-                system="Top. ",
+                system="Top.",
             ),
             merge_inline_system=True,
         )
-        assert result.messages[0] == {"role": "system", "content": "Top. First."}
+        assert result.messages[0] == {"role": "system", "content": "Top.\n\nFirst."}
         assert result.messages[1]["role"] == "user"
         assert len(result.messages) == 2
 
@@ -2452,3 +2454,143 @@ class TestMidConversationToolChanges:
             ValidationError, match='only allowed in messages with role "system"'
         ):
             request_cls(model="test-model", max_tokens=128, **fields)
+
+
+class TestUnsupportedContentBlocks:
+    """Blocks with no chat-completion form become text instead of a 422 that
+    would fail every later request of the session (the block stays in the
+    history): Claude Code sends ``document`` for PDFs read with Read."""
+
+    @staticmethod
+    def _user_text(result) -> list[str]:
+        content = result.messages[-1]["content"]
+        return [content] if isinstance(content, str) else [p["text"] for p in content]
+
+    def test_pdf_document_becomes_a_note(self):
+        result = _convert(
+            _make_request(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "title": "spec.pdf",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": "JVBERi0=",
+                                },
+                            },
+                            {"type": "text", "text": "Summarize it."},
+                        ],
+                    }
+                ]
+            )
+        )
+        assert self._user_text(result) == [
+            "[document 'spec.pdf' (application/pdf) not shown: "
+            "this model reads text only]",
+            "Summarize it.",
+        ]
+
+    def test_text_document_keeps_its_text(self):
+        result = _convert(
+            _make_request(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "title": "notes",
+                                "source": {"type": "text", "data": "line one"},
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+        assert self._user_text(result) == ["Document: notes\nline one"]
+
+    def test_search_result_keeps_its_text(self):
+        result = _convert(
+            _make_request(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "search_result",
+                                "title": "Docs",
+                                "source": "https://example.com",
+                                "content": [{"type": "text", "text": "abc"}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+        assert self._user_text(result) == [
+            "Search result: Docs\nSource: https://example.com\nabc"
+        ]
+
+    def test_unknown_block_type_is_named(self):
+        result = _convert(
+            _make_request(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "container_upload", "file_id": "f1"},
+                            {"type": "text", "text": "hi"},
+                        ],
+                    }
+                ]
+            )
+        )
+        assert self._user_text(result) == ["[container_upload block omitted]", "hi"]
+
+    def test_document_inside_tool_result(self):
+        result = _convert(
+            _make_request(
+                [
+                    {"role": "user", "content": "read it"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Read",
+                                "input": {"file_path": "/a.pdf"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "t1",
+                                "content": [
+                                    {
+                                        "type": "document",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "application/pdf",
+                                            "data": "JVBERi0=",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ]
+            )
+        )
+        tool = [m for m in result.messages if m["role"] == "tool"]
+        assert len(tool) == 1
+        assert tool[0]["content"] == (
+            "[document (application/pdf) not shown: this model reads text only]"
+        )

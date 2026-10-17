@@ -38,6 +38,7 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicTool,
     AnthropicToolChangeDefinition,
     AnthropicUsage,
+    block_as_text,
 )
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.generate.base.protocol import (
@@ -638,6 +639,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                     url = cls._convert_image_source_to_url(source)
                     if url:
                         tool_image_urls.append(url)
+                elif item_type in ("document", "search_result"):
+                    text_parts.append(block_as_text(item))
                 elif item_type == "tool_reference":
                     # A tool search result: the named (deferred) tool is now
                     # available. Text in the same tool message, since chat
