@@ -25,6 +25,12 @@ class ReasoningConfig:
     """String that indicates the start of reasoning."""
     reasoning_end_str: str = ""
     """String forced when the thinking budget is exhausted."""
+    require_reasoning_end: bool = False
+    """Never end a response inside its reasoning section: while reasoning is
+    open, the request's stop tokens are masked until the model writes the
+    natural reasoning end marker. A reasoning model's output puts the answer
+    after that marker, so a stop token before it ends the turn with no answer.
+    Model Runner V2 only."""
 
     _reasoning_start_token_ids: list[int] | None = field(
         default=None, init=False, repr=False

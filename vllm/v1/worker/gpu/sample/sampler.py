@@ -85,7 +85,7 @@ class Sampler:
             or self.bad_words_state.num_bad_words.np[req_idx] > 0
             or (
                 self.thinking_budget_state.enabled
-                and self.thinking_budget_state.use_thinking_budget[req_idx]
+                and self.thinking_budget_state.use_reasoning_state[req_idx]
             )
             or (temperature != 0.0 and temperature != 1.0)
             or states.min_p.np[req_idx] != 0.0
@@ -247,7 +247,9 @@ class Sampler:
         )
 
         # Force the reasoning end marker once a request's thinking budget is
-        # reached; applied before temperature so the forced token is always kept.
+        # reached, and mask stop tokens while reasoning is open
+        # (require_reasoning_end); applied before temperature so the forced
+        # token is always kept.
         self.thinking_budget_state.apply(
             logits,
             expanded_idx_mapping,

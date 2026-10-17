@@ -8,7 +8,8 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_STOP_TOKEN_IDS
 from vllm.v1.worker.gpu.states import RequestState
 
 if TYPE_CHECKING:
@@ -19,7 +20,9 @@ _COLD_SCAN_BLOCK = 1024
 
 
 class ThinkingBudgetState:
-    """Model Runner V2 state for per-request thinking token budgets."""
+    """Model Runner V2 state for each request's open reasoning section: thinking
+    token budgets, and (``require_reasoning_end``) no stop token while reasoning
+    is open."""
 
     def __init__(
         self,
@@ -48,6 +51,9 @@ class ThinkingBudgetState:
         self.enabled = bool(start_ids and end_ids and natural_end_ids)
         if not self.enabled:
             return
+        self.require_reasoning_end = bool(
+            getattr(reasoning_config, "require_reasoning_end", False)
+        )
 
         self.thinking_token_budget = UvaBackedTensor(
             self.max_num_reqs, dtype=torch.int32
@@ -55,6 +61,15 @@ class ThinkingBudgetState:
         self.thinking_token_budget.np.fill(-1)
         self.thinking_token_budget.copy_to_uva()
         self.use_thinking_budget = np.zeros(self.max_num_reqs, dtype=bool)
+        # Stop tokens masked while reasoning is open (require_reasoning_end).
+        self.num_stop_token_ids = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.stop_token_ids = StagedWriteTensor(
+            (self.max_num_reqs, MAX_NUM_STOP_TOKEN_IDS),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Requests whose reasoning section is tracked (budget or stop masking).
+        self.use_reasoning_state = np.zeros(self.max_num_reqs, dtype=bool)
 
         self.cached_last_start = torch.full(
             (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
@@ -87,10 +102,27 @@ class ThinkingBudgetState:
             budget = -1
         else:
             budget = min(budget, _INT32_MAX)
-            self._reset_reqs.append(req_idx)
         if self.thinking_token_budget.np[req_idx] != budget:
             self.thinking_token_budget.np[req_idx] = budget
             self._budget_dirty = True
+
+        stop_token_ids = (
+            list(sampling_params.all_stop_token_ids)
+            if self.require_reasoning_end
+            else []
+        )
+        if len(stop_token_ids) > MAX_NUM_STOP_TOKEN_IDS:
+            raise ValueError(
+                f"Too many stop tokens: {len(stop_token_ids)}. "
+                f"The max size is {MAX_NUM_STOP_TOKEN_IDS}."
+            )
+        self.num_stop_token_ids.np[req_idx] = len(stop_token_ids)
+        if stop_token_ids:
+            self.stop_token_ids.stage_write(req_idx, 0, stop_token_ids)
+
+        self.use_reasoning_state[req_idx] = budget >= 0 or bool(stop_token_ids)
+        if self.use_reasoning_state[req_idx]:
+            self._reset_reqs.append(req_idx)
 
     def apply_staged_writes(self) -> None:
         if not self.enabled:
@@ -106,6 +138,8 @@ class ThinkingBudgetState:
         if self._budget_dirty:
             self.thinking_token_budget.copy_to_uva()
             self._budget_dirty = False
+        self.num_stop_token_ids.copy_to_uva()
+        self.stop_token_ids.apply_write()
 
     def apply(
         self,
@@ -116,7 +150,7 @@ class ThinkingBudgetState:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> None:
-        if not self.enabled or not np.any(self.use_thinking_budget[idx_mapping_np]):
+        if not self.enabled or not np.any(self.use_reasoning_state[idx_mapping_np]):
             return
 
         apply_thinking_budget(
@@ -134,6 +168,8 @@ class ThinkingBudgetState:
             self.reasoning_start_token_ids,
             self.natural_reasoning_end_token_ids,
             self.reasoning_end_token_ids,
+            self.num_stop_token_ids.gpu,
+            self.stop_token_ids.gpu,
         )
 
 
@@ -160,6 +196,7 @@ def _load_effective_token(
 def _update_committed_marker_cache_kernel(
     req_ids_ptr,
     thinking_token_budget_ptr,
+    num_stop_token_ids_ptr,
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
@@ -175,7 +212,8 @@ def _update_committed_marker_cache_kernel(
 ):
     req_state_idx = tl.load(req_ids_ptr + tl.program_id(0))
     budget = tl.load(thinking_token_budget_ptr + req_state_idx)
-    if budget < 0:
+    num_stop_token_ids = tl.load(num_stop_token_ids_ptr + req_state_idx)
+    if budget < 0 and num_stop_token_ids == 0:
         return
 
     total_len = tl.load(total_len_ptr + req_state_idx)
@@ -270,14 +308,19 @@ def _thinking_budget_kernel(
     reasoning_start_token_ids_ptr,
     natural_reasoning_end_token_ids_ptr,
     reasoning_end_token_ids_ptr,
+    num_stop_token_ids_ptr,
+    stop_token_ids_ptr,
+    stop_token_ids_stride,
     START_LEN: tl.constexpr,
     NATURAL_END_LEN: tl.constexpr,
     END_LEN: tl.constexpr,
+    MAX_STOP: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
     budget = tl.load(thinking_token_budget_ptr + req_state_idx)
-    if budget < 0:
+    num_stop_token_ids = tl.load(num_stop_token_ids_ptr + req_state_idx)
+    if budget < 0 and num_stop_token_ids == 0:
         return
 
     local_pos = tl.load(expanded_local_pos_ptr + token_idx)
@@ -329,6 +372,24 @@ def _thinking_budget_kernel(
             last_end = i
 
     if last_start < 0 or last_start <= last_end:
+        return
+
+    # Reasoning is open at this position: a stop token here would end the
+    # response before the reasoning end marker, with no answer.
+    if num_stop_token_ids > 0:
+        offs = tl.arange(0, MAX_STOP)
+        mask = offs < num_stop_token_ids
+        stop_token_ids = tl.load(
+            stop_token_ids_ptr + req_state_idx * stop_token_ids_stride + offs,
+            mask=mask,
+            other=0,
+        )
+        tl.store(
+            logits_ptr + token_idx * logits_stride + stop_token_ids,
+            -float("inf"),
+            mask=mask,
+        )
+    if budget < 0:
         return
 
     reasoning_start = last_start + START_LEN
@@ -384,6 +445,8 @@ def apply_thinking_budget(
     reasoning_start_token_ids: torch.Tensor,
     natural_reasoning_end_token_ids: torch.Tensor,
     reasoning_end_token_ids: torch.Tensor,
+    num_stop_token_ids: torch.Tensor,
+    stop_token_ids: torch.Tensor,
 ) -> None:
     num_tokens = logits.shape[0]
     start_len = reasoning_start_token_ids.shape[0]
@@ -393,6 +456,7 @@ def apply_thinking_budget(
     _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
         req_ids,
         thinking_token_budget,
+        num_stop_token_ids,
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
@@ -422,7 +486,11 @@ def apply_thinking_budget(
         reasoning_start_token_ids,
         natural_reasoning_end_token_ids,
         reasoning_end_token_ids,
+        num_stop_token_ids,
+        stop_token_ids,
+        stop_token_ids.stride(0),
         START_LEN=start_len,
         NATURAL_END_LEN=natural_end_len,
         END_LEN=end_len,
+        MAX_STOP=stop_token_ids.shape[1],
     )

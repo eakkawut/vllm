@@ -299,3 +299,98 @@ def test_v2_thinking_budget_continues_end_prefix_from_prompt():
 
     assert out[0, END_B] == pytest.approx(1.0e9)
     assert out[0, END_A] == 0
+
+
+STOP = 94
+EOS = 95
+
+
+class MockRequireEndReasoningConfig(MockReasoningConfig):
+    require_reasoning_end = True
+
+
+def _require_end_state(tokens: list[int]) -> ThinkingBudgetState:
+    state = ThinkingBudgetState(
+        _make_req_states(tokens, prompt_len=1), MockRequireEndReasoningConfig()
+    )
+    state.add_request(3, SamplingParams(stop_token_ids=[STOP, EOS]))
+    state.apply_staged_writes()
+    return state
+
+
+def test_v2_require_reasoning_end_masks_stop_tokens_while_reasoning():
+    """No thinking budget: a stop token inside open reasoning would end the
+    response with no answer, so it is masked."""
+    state = _require_end_state([1, START, 10, 11])
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[11], local_pos=[0])
+
+    assert out[0, STOP] == -float("inf")
+    assert out[0, EOS] == -float("inf")
+    assert torch.all(out[0, :STOP] == 0)
+
+
+def test_v2_require_reasoning_end_allows_stop_after_reasoning_end():
+    state = _require_end_state([1, START, 10, END, 12])
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[12], local_pos=[0])
+
+    assert torch.all(out == 0)
+
+
+def test_v2_require_reasoning_end_follows_draft_end_marker():
+    """Spec decode: rows after a drafted end marker may stop, rows before it
+    may not."""
+    state = _require_end_state([1, START, 10, 11])
+    logits = torch.zeros((3, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[11, END, 12], local_pos=[0, 1, 2])
+
+    assert out[0, STOP] == -float("inf")
+    assert torch.all(out[1:] == 0)
+
+
+def test_v2_require_reasoning_end_off_by_default():
+    state = ThinkingBudgetState(
+        _make_req_states([1, START, 10, 11], prompt_len=1), MockReasoningConfig()
+    )
+    state.add_request(3, SamplingParams(stop_token_ids=[STOP, EOS]))
+    state.apply_staged_writes()
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    out = _apply(state, logits, input_ids=[11], local_pos=[0])
+
+    assert torch.all(out == 0)
+
+
+def test_v2_sampler_never_samples_stop_inside_reasoning():
+    """End to end through the sampler: even when the model puts nearly all
+    probability on a stop token, the sampled token is not a stop token."""
+    req_states = _make_req_states([1, START, 10, 11], prompt_len=1)
+    sampler = Sampler(
+        max_num_reqs=4,
+        vocab_size=VOCAB_SIZE,
+        device=DEVICE,
+        req_states=req_states,
+        reasoning_config=MockRequireEndReasoningConfig(),
+    )
+    sampler.add_request(
+        req_idx=3,
+        prompt_len=1,
+        sampling_params=SamplingParams(temperature=0.0, stop_token_ids=[STOP]),
+    )
+    sampler.apply_staged_writes()
+
+    idx_mapping = torch.tensor([3], dtype=torch.int32, device=DEVICE)
+    logits = torch.zeros((1, VOCAB_SIZE), device=DEVICE)
+    logits[0, STOP] = 50.0
+    logits[0, END] = 1.0
+    out = sampler.apply_sampling_params(
+        logits,
+        idx_mapping.clone(),
+        idx_mapping,
+        idx_mapping.cpu().numpy(),
+        torch.tensor([3], dtype=torch.int32, device=DEVICE),
+        torch.tensor([11], dtype=torch.int32, device=DEVICE),
+        torch.tensor([0], dtype=torch.int32, device=DEVICE),
+    )
+
+    assert out[0].argmax().item() == END
