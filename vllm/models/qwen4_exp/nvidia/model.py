@@ -79,6 +79,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from ..config import Qwen4ExpConfig
 from .b12x_ple import B12xNGramEmbedding, _resolve_ple_table_memory
 from .b12x_qsa import Qwen4ExpQSAAttention as B12xQSAAttention
+from . import debug_dump
 from .backend import uses_b12x
 from .hyperconnection import (
     GatedResidual,
@@ -334,6 +335,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 query_start_loc,
                 ngram_context,
             )
+            debug_dump.dump("main", self.layer_idx, "ple", positions, hidden_states)
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None:
@@ -352,6 +354,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             raise ValueError("Invalid layer_type")
+        debug_dump.dump("main", self.layer_idx, "in:" + self.layer_type, positions, block_input)
+        debug_dump.dump("main", self.layer_idx, "attn:" + self.layer_type, positions, attn_out)
 
         if output_indices is not None:
             hidden_states = hidden_states[output_indices]
@@ -363,6 +367,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, attn_out, injection
         )
         mlp_out = self.mlp(block_input)
+        if output_indices is None:
+            debug_dump.dump("main", self.layer_idx, "mlp", positions, mlp_out)
         return hidden_states, mlp_out, injection
 
 
