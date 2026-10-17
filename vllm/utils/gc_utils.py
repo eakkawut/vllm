@@ -135,6 +135,20 @@ def freeze_gc_heap() -> None:
     # Freeze all GC tracked objects
     gc.freeze()
 
+    # spark-vllm-docker: trim unused CPU heap pages after startup GC.
+    # Both API servers and workers freeze their heaps after startup/warmup.
+    # GC frees objects, but glibc can retain their pages until explicitly trimmed.
+    try:
+        import ctypes
+
+        malloc_trim = ctypes.CDLL(None).malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        malloc_trim(0)
+    except (AttributeError, OSError):
+        # Allocators/platforms without glibc's malloc_trim need no action here.
+        pass
+
 
 def maybe_attach_gc_debug_callback() -> None:
     """
