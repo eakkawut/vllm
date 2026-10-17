@@ -303,7 +303,9 @@ class AnthropicServingMessages(OpenAIServingChat):
             reasoning_effort=effort,
         )
         try:
-            result = await self.online_renderer.render_chat(request)
+            result = await self.online_renderer.render_chat(
+                request, skip_mm_cache=True
+            )
         except Exception:
             logger.debug("Rendering reasoning_effort=%r failed", effort, exc_info=True)
             return None
@@ -1342,7 +1344,10 @@ class AnthropicServingMessages(OpenAIServingChat):
             request,
             merge_inline_system=self._merge_inline_system,
         )
-        result = await self.render_chat_request(chat_req)
+        # Rendered only, never sent to the engine: recording its images in the
+        # frontend multi-modal cache made the next real request send them by
+        # hash only, which the engine did not have (P0/P1 cache drift -> 500).
+        result = await self.render_chat_request(chat_req, skip_mm_cache=True)
         if isinstance(result, ErrorResponse):
             return result
 

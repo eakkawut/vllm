@@ -219,12 +219,17 @@ class OpenAIServingChat(GenerateBaseServing):
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
+        *,
+        skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """
         Validate the model and preprocess a chat completion request.
 
         Delegates preprocessing logic to OnlineRenderer, adding the
         engine-aware checks (LoRA model validation, engine health).
+        ``skip_mm_cache``: the result is not sent to the engine (e.g. token
+        counting), so the frontend multi-modal cache must not record its items
+        as sent.
 
         Returns:
             A tuple of (conversation, engine_inputs) on success,
@@ -237,7 +242,9 @@ class OpenAIServingChat(GenerateBaseServing):
 
         self._preflight(request.n or 1)
 
-        return await self.online_renderer.render_chat(request)
+        return await self.online_renderer.render_chat(
+            request, skip_mm_cache=skip_mm_cache
+        )
 
     async def create_chat_completion(
         self,

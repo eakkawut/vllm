@@ -2207,7 +2207,7 @@ class TestProbeDisabledThinkingEffort:
         obj = MagicMock(spec=AnthropicServingMessages)
         obj.online_renderer = MagicMock()
         obj.online_renderer.render_chat = AsyncMock(
-            side_effect=lambda req: ([], [render(req.reasoning_effort)])
+            side_effect=lambda req, **kw: ([], [render(req.reasoning_effort)])
         )
         obj._extract_prompt_components = lambda engine_input: SimpleNamespace(
             token_ids=engine_input, text=None
@@ -2667,3 +2667,32 @@ class TestStopReasonForToolCalls:
             d["delta"] for ev, d in _parse_sse_events(output) if ev == "message_delta"
         ]
         assert deltas == [{"stop_reason": "tool_use", "stop_sequence": None}]
+
+
+class TestCountTokensLeavesMultiModalCache:
+    """count_tokens renders but never sends to the engine, so it must not
+    record images in the frontend multi-modal cache: otherwise the next real
+    request with the same image sends it by hash only, the engine does not
+    have it (P0/P1 cache drift) and the request fails with 500. Claude Code
+    and gx10-guard call count_tokens before sending large requests."""
+
+    @pytest.mark.asyncio
+    async def test_render_skips_mm_cache(self):
+        handler = MagicMock(spec=AnthropicServingMessages)
+        handler._merge_inline_system = True
+        handler.to_chat_completion_request = (
+            AnthropicServingMessages.to_chat_completion_request
+        )
+        handler.render_chat_request = AsyncMock(
+            return_value=([], [{"prompt_token_ids": [1, 2, 3]}])
+        )
+        request = AnthropicCountTokensRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        result = await AnthropicServingMessages.count_tokens(handler, request)
+
+        assert result.input_tokens == 3
+        assert handler.render_chat_request.await_args.kwargs == {
+            "skip_mm_cache": True
+        }
