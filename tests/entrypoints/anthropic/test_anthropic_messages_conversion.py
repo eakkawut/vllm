@@ -2594,3 +2594,76 @@ class TestUnsupportedContentBlocks:
         assert tool[0]["content"] == (
             "[document (application/pdf) not shown: this model reads text only]"
         )
+
+
+class TestStopReasonForToolCalls:
+    """Anthropic reports ``tool_use`` whenever the turn ends in a tool call,
+    including a named (forced) one, for which the chat layer says ``stop``.
+    Claude Code forces ``Write`` with ``tool_choice: {type: tool}``."""
+
+    @staticmethod
+    def _full(finish_reason, stop_reason=None, with_tool=True):
+        return ChatCompletionResponse(
+            id="chatcmpl-x",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            ToolCall(
+                                id="call_1",
+                                function=FunctionCall(name="Write", arguments="{}"),
+                            )
+                        ]
+                        if with_tool
+                        else [],
+                    ),
+                    finish_reason=finish_reason,
+                    stop_reason=stop_reason,
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+    @pytest.mark.parametrize(
+        "finish_reason,stop_reason,with_tool,expected",
+        [
+            ("stop", None, True, ("tool_use", None)),  # named tool choice
+            ("tool_calls", None, True, ("tool_use", None)),
+            ("length", None, True, ("max_tokens", None)),
+            ("stop", "</x>", True, ("stop_sequence", "</x>")),
+            ("stop", None, False, ("end_turn", None)),
+        ],
+    )
+    def test_full(self, finish_reason, stop_reason, with_tool, expected):
+        result = _make_full_converter().messages_full_converter(
+            self._full(finish_reason, stop_reason, with_tool)
+        )
+        assert (result.stop_reason, result.stop_sequence) == expected
+
+    @pytest.mark.asyncio
+    async def test_stream_named_tool_call(self):
+        async def sse_input():
+            yield _make_stream_chunk(delta=DeltaMessage(role="assistant"))
+            yield _make_stream_chunk(
+                delta=DeltaMessage(
+                    tool_calls=[_tc(id="call_1", name="Write", args='{"a":1}')]
+                )
+            )
+            yield _make_stream_chunk(finish_reason="stop")
+            yield _make_stream_chunk(
+                choices=[],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+            yield "data: [DONE]"
+
+        output = [
+            e async for e in _make_stream_converter().message_stream_converter(sse_input())
+        ]
+        deltas = [
+            d["delta"] for ev, d in _parse_sse_events(output) if ev == "message_delta"
+        ]
+        assert deltas == [{"stop_reason": "tool_use", "stop_sequence": None}]

@@ -193,6 +193,30 @@ async def _iter_with_keepalive(
                 await pending
 
 
+def _to_anthropic_stop_reason(
+    finish_reason: str | None, stop_reason: int | str | None, tool_used: bool
+) -> tuple[str | None, str | None]:
+    """Anthropic ``(stop_reason, stop_sequence)`` for an OpenAI finish reason.
+
+    Anthropic reports ``tool_use`` whenever the turn ends in a tool call. The
+    chat layer reports ``finish_reason="stop"`` for a named (forced) tool call
+    (Claude Code forces ``Write`` this way), so ``tool_used`` records whether
+    a ``tool_use`` block was produced. ``max_tokens`` always wins, and a
+    matched stop string wins over a tool call it may have cut short.
+    """
+    if finish_reason == "length":
+        return "max_tokens", None
+    if finish_reason == "tool_calls":
+        return "tool_use", None
+    if finish_reason not in (None, "stop"):
+        return None, None
+    # vLLM reports the matched stop string in stop_reason (a str);
+    # an int stop-token-id or None (natural EOS) is not a stop sequence.
+    if isinstance(stop_reason, str):
+        return "stop_sequence", stop_reason
+    return ("tool_use" if tool_used else "end_turn"), None
+
+
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
@@ -914,18 +938,14 @@ class AnthropicServingMessages(OpenAIServingChat):
             ec_transfer_params=generator.ec_transfer_params,
         )
         choice = generator.choices[0]
-        if choice.finish_reason == "stop":
-            # vLLM reports the matched stop string in stop_reason (a str);
-            # an int stop-token-id or None (natural EOS) maps to end_turn.
-            if isinstance(choice.stop_reason, str):
-                result.stop_reason = "stop_sequence"
-                result.stop_sequence = choice.stop_reason
-            else:
-                result.stop_reason = "end_turn"
-        elif choice.finish_reason == "length":
-            result.stop_reason = "max_tokens"
-        elif choice.finish_reason == "tool_calls":
-            result.stop_reason = "tool_use"
+        stop_reason, stop_sequence = _to_anthropic_stop_reason(
+            choice.finish_reason,
+            choice.stop_reason,
+            tool_used=bool(choice.message.tool_calls),
+        )
+        if stop_reason is not None:
+            result.stop_reason = stop_reason  # type: ignore[assignment]
+            result.stop_sequence = stop_sequence
 
         content: list[AnthropicContentBlock] = []
         if choice.message.reasoning:
@@ -1125,19 +1145,17 @@ class AnthropicServingMessages(OpenAIServingChat):
                         if len(origin_chunk.choices) == 0:
                             for event in stop_and_flush():
                                 yield event
-                            if isinstance(stop_sequence, str):
-                                stop_delta = AnthropicDelta(
-                                    stop_reason="stop_sequence",
-                                    stop_sequence=stop_sequence,
-                                )
-                            else:
-                                stop_delta = AnthropicDelta(
-                                    stop_reason=self.stop_reason_map.get(
-                                        finish_reason or "stop"
-                                    ),
-                                    # Set explicitly so exclude_unset=True keeps it.
-                                    stop_sequence=None,
-                                )
+                            mapped, matched = _to_anthropic_stop_reason(
+                                finish_reason,
+                                stop_sequence,
+                                tool_used=bool(tool_index_to_id),
+                            )
+                            stop_delta = AnthropicDelta(
+                                stop_reason=mapped
+                                or self.stop_reason_map.get(finish_reason or "stop"),
+                                # Set explicitly so exclude_unset=True keeps it.
+                                stop_sequence=matched,
+                            )
                             chunk = AnthropicStreamEvent(
                                 type="message_delta",
                                 delta=stop_delta,
