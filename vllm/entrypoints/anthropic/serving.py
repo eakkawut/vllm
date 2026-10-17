@@ -23,6 +23,7 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicCountTokensResponse,
     AnthropicDelta,
     AnthropicError,
+    AnthropicMessage,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicOutputConfig,
@@ -240,13 +241,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                             continue
                         system_parts.append(block.text)
 
-        # When the template requires system-first ordering, extract inline
-        # system messages from the messages array and merge them into the
-        # top-level block so the template doesn't reject them.
+        # When the template requires system-first ordering, system messages
+        # that open the messages array join the top-level block. Later ones
+        # stay where they are (see _fold_inline_system).
         if merge_inline_system:
             for msg in anthropic_request.messages:
                 if msg.role != "system":
-                    continue
+                    break
                 text = cls._extract_system_text(msg)
                 if text:
                     system_parts.append(text)
@@ -271,6 +272,56 @@ class AnthropicServingMessages(OpenAIServingChat):
         return "".join(parts) if parts else None
 
     @classmethod
+    def _fold_inline_system(cls, messages: list) -> list:
+        """Keep mid-conversation system messages in place for templates that
+        only take a leading system message: each becomes a
+        ``<system-reminder>`` text block of the user turn next to it (the
+        previous one, else the next one), the form Claude Code itself uses for
+        reminders. Moving them into the leading system block instead changed
+        the start of the prompt on every turn (Claude Code adds one almost
+        every turn), so the prefix cache never hit.
+        """
+        out: list = []
+        pending: list[AnthropicContentBlock] = []
+        leading = True
+        for msg in messages:
+            if msg.role == "system":
+                if leading:
+                    continue  # merged into the top-level block
+                text = cls._extract_system_text(msg)
+                if not text:
+                    continue
+                block = AnthropicContentBlock(
+                    type="text", text=f"<system-reminder>\n{text}\n</system-reminder>"
+                )
+                if out and out[-1].role == "user":
+                    out[-1] = cls._with_blocks(out[-1], after=[block])
+                else:
+                    pending.append(block)
+                continue
+            leading = False
+            if pending and msg.role == "user":
+                msg = cls._with_blocks(msg, before=pending)
+                pending = []
+            out.append(msg)
+        if pending:
+            out.append(AnthropicMessage(role="user", content=pending))
+        return out
+
+    @staticmethod
+    def _with_blocks(
+        msg: AnthropicMessage,
+        before: list[AnthropicContentBlock] = (),  # type: ignore[assignment]
+        after: list[AnthropicContentBlock] = (),  # type: ignore[assignment]
+    ) -> AnthropicMessage:
+        content = (
+            [AnthropicContentBlock(type="text", text=msg.content)]
+            if isinstance(msg.content, str)
+            else list(msg.content)
+        )
+        return msg.model_copy(update={"content": [*before, *content, *after]})
+
+    @classmethod
     def _convert_messages(
         cls,
         messages: list,
@@ -279,6 +330,8 @@ class AnthropicServingMessages(OpenAIServingChat):
         merge_inline_system: bool = False,
     ) -> None:
         """Convert Anthropic messages to OpenAI format"""
+        if merge_inline_system:
+            messages = cls._fold_inline_system(messages)
         for msg in messages:
             # Handle system messages in-place: extract text, strip billing
             # headers, and only emit if there is real content.  This avoids
@@ -286,8 +339,6 @@ class AnthropicServingMessages(OpenAIServingChat):
             # doesn't strip billing headers and may produce messages with
             # no "content" key.
             if msg.role == "system":
-                if merge_inline_system:
-                    continue  # already merged into top-level by _convert_system_message
                 text = cls._extract_system_text(msg)
                 if text:
                     openai_messages.append({"role": "system", "content": text})

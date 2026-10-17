@@ -1727,3 +1727,122 @@ class TestClientErrorResponses:
 
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"]["type"] == "BadRequestError"
+
+
+class TestInlineSystemForSystemFirstTemplates:
+    """Templates that only take a leading system message (Qwen): system
+    messages that open the conversation join the top-level system block, later
+    ones stay in place as ``<system-reminder>`` text of the adjacent user turn.
+    Merging them into the leading block changed the start of the prompt on
+    every turn, so the prefix cache never hit."""
+
+    @staticmethod
+    def _texts(content) -> list[str]:
+        if isinstance(content, str):
+            return [content]
+        return [part["text"] for part in content]
+
+    def test_appended_to_previous_user_turn(self):
+        result = _convert(
+            _make_request(
+                [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "assistant", "content": "Hi"},
+                    {"role": "user", "content": "2 + 2?"},
+                ],
+                system="Top.",
+            ),
+            merge_inline_system=True,
+        )
+        assert [m["role"] for m in result.messages] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert result.messages[0]["content"] == "Top."
+        assert self._texts(result.messages[1]["content"]) == [
+            "Hello",
+            "<system-reminder>\nBe brief.\n</system-reminder>",
+        ]
+
+    def test_prepended_to_next_user_turn_after_assistant(self):
+        result = _convert(
+            _make_request(
+                [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "user", "content": "2 + 2?"},
+                ]
+            ),
+            merge_inline_system=True,
+        )
+        assert [m["role"] for m in result.messages] == ["user", "assistant", "user"]
+        assert self._texts(result.messages[2]["content"]) == [
+            "<system-reminder>\nBe brief.\n</system-reminder>",
+            "2 + 2?",
+        ]
+
+    def test_trailing_after_assistant_becomes_user_turn(self):
+        result = _convert(
+            _make_request(
+                [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                    {"role": "system", "content": "Be brief."},
+                ]
+            ),
+            merge_inline_system=True,
+        )
+        assert [m["role"] for m in result.messages] == ["user", "assistant", "user"]
+        assert self._texts(result.messages[2]["content"]) == [
+            "<system-reminder>\nBe brief.\n</system-reminder>"
+        ]
+
+    def test_leading_system_messages_join_top_level(self):
+        result = _convert(
+            _make_request(
+                [
+                    {"role": "system", "content": "First."},
+                    {"role": "user", "content": "Hello"},
+                ],
+                system="Top. ",
+            ),
+            merge_inline_system=True,
+        )
+        assert result.messages[0] == {"role": "system", "content": "Top. First."}
+        assert result.messages[1]["role"] == "user"
+        assert len(result.messages) == 2
+
+    def test_billing_header_only_is_dropped(self):
+        result = _convert(
+            _make_request(
+                [
+                    {"role": "user", "content": "Hello"},
+                    {
+                        "role": "system",
+                        "content": "x-anthropic-billing-header: cc_version=2.1",
+                    },
+                ]
+            ),
+            merge_inline_system=True,
+        )
+        assert len(result.messages) == 1
+        assert self._texts(result.messages[0]["content"]) == ["Hello"]
+
+    def test_next_turn_extends_the_previous_prompt(self):
+        """The leading system block does not change when a turn adds an inline
+        system message, so the earlier prompt stays a prefix."""
+        turn1 = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        turn2 = turn1 + [
+            {"role": "system", "content": "<total_tokens>9</total_tokens>"},
+            {"role": "user", "content": "Next"},
+        ]
+        r1 = _convert(_make_request(turn1, system="Top."), merge_inline_system=True)
+        r2 = _convert(_make_request(turn2, system="Top."), merge_inline_system=True)
+        assert r2.messages[: len(r1.messages)] == r1.messages

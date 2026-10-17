@@ -820,11 +820,11 @@ async def test_messages_render_system_and_multi_turn(client):
 
 @pytest.mark.asyncio
 async def test_messages_render_merges_inline_system(client):
-    """Inline system messages merge into the leading system block.
+    """Inline system messages stay in place as a <system-reminder> block.
 
     Without a --chat-template arg the /v1/messages server path detects
-    merge_inline_system=True, so render must produce the same tokens as
-    the manually pre-merged request.
+    merge_inline_system=True (system-first template), so render must produce
+    the same tokens as the request with the reminder in the next user turn.
     """
     inline = await client.post(
         "/v1/messages/render",
@@ -847,11 +847,22 @@ async def test_messages_render_merges_inline_system(client):
         json={
             "model": MODEL_NAME,
             "max_tokens": 16,
-            "system": "You are a helpful assistant.Be brief.",
+            "system": "You are a helpful assistant.",
             "messages": [
                 {"role": "user", "content": "Hello"},
                 {"role": "assistant", "content": "Hi! How can I help?"},
-                {"role": "user", "content": "What is 2 + 2?"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>
+Be brief.
+</system-reminder>",
+                        },
+                        {"type": "text", "text": "What is 2 + 2?"},
+                    ],
+                },
             ],
         },
     )
