@@ -1381,7 +1381,14 @@ class AnthropicServingMessages(OpenAIServingChat):
         # Rendered only, never sent to the engine: recording its images in the
         # frontend multi-modal cache made the next real request send them by
         # hash only, which the engine did not have (P0/P1 cache drift -> 500).
-        result = await self.render_chat_request(chat_req, skip_mm_cache=True)
+        try:
+            result = await self.render_chat_request(chat_req, skip_mm_cache=True)
+        except VLLMValidationError as e:
+            # Same error as /v1/messages, so a client that counts first
+            # compacts instead of failing.
+            if (error := self._prompt_too_long_error(e)) is not None:
+                return error
+            raise
         if isinstance(result, ErrorResponse):
             return result
 

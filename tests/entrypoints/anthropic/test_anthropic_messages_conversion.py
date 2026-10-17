@@ -1991,6 +1991,35 @@ class TestClientErrorResponses:
         assert error["type"] == expected_type
         assert expected_message in error["message"]
 
+    def test_count_tokens_prompt_too_long_uses_anthropic_error(self):
+        handler = MagicMock(spec=AnthropicServingMessages)
+        handler.count_tokens = AnthropicServingMessages.count_tokens.__get__(handler)
+        handler._prompt_too_long_error = (
+            AnthropicServingMessages._prompt_too_long_error.__get__(handler)
+        )
+        handler.to_chat_completion_request = (
+            AnthropicServingMessages.to_chat_completion_request
+        )
+        handler.model_config = SimpleNamespace(max_model_len=100)
+        handler._merge_inline_system = False
+        handler.render_chat_request = AsyncMock(
+            side_effect=VLLMValidationError(
+                "too long", parameter="input_tokens", value=150
+            )
+        )
+
+        app = self._make_api_app(handler)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/v1/messages/count_tokens",
+                json={"model": "m", "messages": [{"role": "user", "content": "x"}]},
+            )
+
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert "prompt is too long: 150 tokens > 100" in error["message"]
+
     def test_generic_error_still_returns_internal_server_error(self):
         """Non-client errors keep the existing 500 behaviour."""
         handler = MagicMock(spec=AnthropicServingMessages)
