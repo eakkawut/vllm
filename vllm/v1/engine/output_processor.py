@@ -30,7 +30,7 @@ from vllm.tracing import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
-from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+from vllm.v1.engine.detokenizer import IncrementalDetokenizer, ReasoningMarkers
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import (
@@ -232,6 +232,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        reasoning_markers: ReasoningMarkers | None = None,
     ) -> "RequestState":
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
@@ -247,6 +248,7 @@ class RequestState:
             detokenizer = IncrementalDetokenizer.from_new_request(
                 tokenizer=tokenizer,
                 request=request,
+                reasoning_markers=reasoning_markers,
             )
             max_tokens_param = sampling_params.max_tokens
             top_p = sampling_params.top_p
@@ -462,9 +464,11 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        reasoning_markers: ReasoningMarkers | None = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
+        self.reasoning_markers = reasoning_markers
         self.stream_interval = stream_interval
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
@@ -587,6 +591,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            reasoning_markers=self.reasoning_markers,
         )
         self.request_states[request_id] = req_state
         if parent_req:

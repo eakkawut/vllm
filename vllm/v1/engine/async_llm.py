@@ -48,6 +48,7 @@ from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.engine.detokenizer import reasoning_markers
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.stall_diagnostics import RequestTimeline, arrival_time
@@ -162,6 +163,7 @@ class AsyncLLM(EngineClient):
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
+            reasoning_markers=reasoning_markers(self.vllm_config),
         )
 
         # EngineCore (starts the engine in background process).

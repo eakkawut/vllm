@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import sys
+from typing import TYPE_CHECKING
 from abc import ABC, abstractmethod
 
 import tokenizers
@@ -18,11 +19,34 @@ from vllm.tokenizers.detokenizer_utils import (
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreRequest
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
 logger = init_logger(__name__)
 
 # Only tokenizers >= 0.22.0 supports DecodeStream with native prefill
 # (ids parameter) used for FastIncrementalDetokenizer.
 USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0.22.0")
+
+# (reasoning start token ids, natural reasoning end token ids) of the served
+# model, e.g. ([<think>], [</think>]); None without a reasoning parser.
+ReasoningMarkers = tuple[list[int], list[int]]
+
+
+def reasoning_markers(vllm_config: "VllmConfig") -> ReasoningMarkers | None:
+    """The served model's reasoning start / natural end token ids, if any."""
+    rc = vllm_config.reasoning_config
+    if rc is None or not rc.enabled:
+        return None
+    start, end = rc.reasoning_start_token_ids, rc.natural_reasoning_end_token_ids
+    return (start, end) if start and end else None
+
+
+def _last_index(token_ids: list[int], marker: list[int]) -> int:
+    for i in range(len(token_ids) - len(marker), -1, -1):
+        if token_ids[i : i + len(marker)] == marker:
+            return i
+    return -1
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
@@ -51,6 +75,7 @@ class IncrementalDetokenizer:
         cls,
         tokenizer: TokenizerLike | None,
         request: EngineCoreRequest,
+        reasoning_markers: ReasoningMarkers | None = None,
     ) -> "IncrementalDetokenizer":
         assert request.sampling_params is not None
 
@@ -60,14 +85,18 @@ class IncrementalDetokenizer:
 
         if USE_FAST_DETOKENIZER and isinstance(tokenizer, TokenizersBackend):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            return FastIncrementalDetokenizer(tokenizer, request)
+            return FastIncrementalDetokenizer(tokenizer, request, reasoning_markers)
 
         # Fall back to slow python-based incremental detokenization.
-        return SlowIncrementalDetokenizer(tokenizer, request)
+        return SlowIncrementalDetokenizer(tokenizer, request, reasoning_markers)
 
 
 class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
-    def __init__(self, request: EngineCoreRequest):
+    def __init__(
+        self,
+        request: EngineCoreRequest,
+        reasoning_markers: ReasoningMarkers | None = None,
+    ):
         super().__init__()
 
         # Stop strings
@@ -89,6 +118,18 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         else:
             self.stop_buffer_length = 0
         self._last_output_text_offset: int = 0
+
+        # Stop strings apply to the response, not the reasoning: when the
+        # prompt leaves the model inside its reasoning, they stay dormant
+        # until the output closes it (Claude Code's classifier stops on
+        # "</block>", which the model may well write while thinking).
+        self._reasoning_end: list[int] | None = None
+        self._content_start = 0
+        if self.stop and reasoning_markers is not None:
+            start, end = reasoning_markers
+            prompt = list(request.prompt_token_ids or ())
+            if start and end and _last_index(prompt, start) > _last_index(prompt, end):
+                self._reasoning_end = end
 
         # Generation data
         self.output_text = ""
@@ -121,6 +162,10 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             if self.min_tokens and self.num_output_tokens() <= self.min_tokens:
                 stop_check_offset = len(self.output_text)
+            end = self._reasoning_end
+            if end is not None and self.token_ids[-len(end) :] == end:
+                self._reasoning_end = None
+                self._content_start = len(self.output_text)
 
         if skipped_stop_token_id is not None:
             # Cleanup after skipping detokenization.
@@ -128,17 +173,27 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # 2) Evaluate stop strings.
         stop_string = None
-        if self.stop and self.num_output_tokens() > self.min_tokens:
+        if (
+            self.stop
+            and self._reasoning_end is None
+            and self.num_output_tokens() > self.min_tokens
+        ):
+            # Search the response only: a match may not start in the reasoning.
+            content = self.output_text[self._content_start :]
             stop = check_stop_strings(
-                output_text=self.output_text,
-                new_char_count=len(self.output_text) - stop_check_offset,
+                output_text=content,
+                new_char_count=min(
+                    len(self.output_text) - stop_check_offset, len(content)
+                ),
                 stop=self.stop,
                 include_in_output=self.include_stop_str_in_output,
             )
             if stop is not None:
                 stop_string, truncate_to = stop
                 if truncate_to != -1:
-                    self.output_text = self.output_text[:truncate_to]
+                    self.output_text = self.output_text[
+                        : self._content_start + truncate_to
+                    ]
 
         return stop_string
 
@@ -166,8 +221,13 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
 
 class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
-    def __init__(self, tokenizer: TokenizersBackend, request: EngineCoreRequest):
-        super().__init__(request)
+    def __init__(
+        self,
+        tokenizer: TokenizersBackend,
+        request: EngineCoreRequest,
+        reasoning_markers: ReasoningMarkers | None = None,
+    ):
+        super().__init__(request, reasoning_markers)
 
         sampling_params = request.sampling_params
         assert sampling_params is not None
@@ -249,8 +309,13 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
 
 class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
-    def __init__(self, tokenizer: TokenizerLike, request: EngineCoreRequest):
-        super().__init__(request)
+    def __init__(
+        self,
+        tokenizer: TokenizerLike,
+        request: EngineCoreRequest,
+        reasoning_markers: ReasoningMarkers | None = None,
+    ):
+        super().__init__(request, reasoning_markers)
 
         self.tokenizer = tokenizer
         params = request.sampling_params
