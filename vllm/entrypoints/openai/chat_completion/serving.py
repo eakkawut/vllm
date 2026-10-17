@@ -755,8 +755,15 @@ class OpenAIServingChat(GenerateBaseServing):
                         # In OpenAI's API, when a tool is called, the
                         # finish_reason is:
                         # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
-                        if tools_streamed[i] and not tool_choice_function_name:
+                        # and "stop" for named tool calls. A generation cut off
+                        # by max_tokens keeps "length": its last tool call may
+                        # be incomplete, and "tool_calls" would present it as
+                        # finished.
+                        if (
+                            tools_streamed[i]
+                            and not tool_choice_function_name
+                            and output.finish_reason in (None, "stop")
+                        ):
                             finish_reason_ = "tool_calls"
                         else:
                             finish_reason_ = (
@@ -1067,11 +1074,11 @@ class OpenAIServingChat(GenerateBaseServing):
 
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            # and "stop" for named tool calls. A generation cut off by
+            # max_tokens keeps "length" (its last tool call may be incomplete).
+            is_finish_reason_tool_calls = output.finish_reason in (None, "stop") and (
+                auto_tools_called
+                or (request.tool_choice and request.tool_choice == "required")
             )
 
             routed_experts_b64 = (

@@ -2445,3 +2445,178 @@ def test_make_request_with_harmony_reuses_kv_transfer_prompt_token_ids():
     assert engine_input["prompt_token_ids"] == [10, 20, 30]
     # The reuse key is consumed and other kv_transfer_params are preserved.
     assert request.kv_transfer_params == {"do_remote_prefill": True}
+
+
+def _hermes_serving_chat() -> OpenAIServingChat:
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+    models = OpenAIServingModels(
+        engine_client=mock_engine,
+        base_model_paths=BASE_MODEL_PATHS,
+    )
+    return OpenAIServingChat(
+        mock_engine,
+        models,
+        response_role="assistant",
+        online_renderer=_build_online_renderer(mock_engine, models.registry),
+        chat_template=CHAT_TEMPLATE,
+        chat_template_content_format="auto",
+        request_logger=None,
+        enable_auto_tools=True,
+        tool_parser="hermes",
+    )
+
+
+_WEATHER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+
+async def _outputs(tokenizer, text: str, finish_reason: str, stream: bool):
+    """Engine outputs for ``text``: one token per step when streaming, the
+    whole text at once otherwise; the last output carries finish_reason."""
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if not stream:
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text=text,
+                    token_ids=token_ids,
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason=finish_reason,
+                )
+            ],
+            finished=True,
+        )
+        return
+    prev = ""
+    for i, tid in enumerate(token_ids):
+        decoded = tokenizer.decode(token_ids[: i + 1])
+        last = i == len(token_ids) - 1
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text=decoded[len(prev) :],
+                    token_ids=[tid],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason=finish_reason if last else None,
+                )
+            ],
+            finished=last,
+        )
+        prev = decoded
+
+
+_COMPLETE_CALL = (
+    "<tool_call>\n"
+    '{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n'
+    "</tool_call>"
+)
+_CUT_CALL = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Osa'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,finish_reason,expected",
+    [
+        (_COMPLETE_CALL, "stop", "tool_calls"),
+        # max_tokens hit inside the (last) tool call: not a finished call
+        (_CUT_CALL, "length", "length"),
+        (_COMPLETE_CALL + "\n" + _CUT_CALL, "length", "length"),
+    ],
+)
+async def test_streaming_tool_call_cut_by_max_tokens_reports_length(
+    text, finish_reason, expected
+):
+    serving_chat = _hermes_serving_chat()
+    tokenizer = get_tokenizer(MODEL_NAME)
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "test"}],
+        stream=True,
+        tools=_WEATHER_TOOLS,
+        tool_choice="auto",
+    )
+    reasons = []
+    async for chunk_str in serving_chat.chat_completion_stream_generator(
+        request=request,
+        result_generator=_outputs(tokenizer, text, finish_reason, stream=True),
+        request_id="test-req",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=tokenizer,
+        request_metadata=RequestResponseMetadata(
+            request_id="test-req", model_name=MODEL_NAME
+        ),
+    ):
+        if chunk_str.startswith("data: ") and "[DONE]" not in chunk_str:
+            for choice in json.loads(chunk_str[6:]).get("choices", []):
+                if choice.get("finish_reason") is not None:
+                    reasons.append(choice["finish_reason"])
+    assert reasons == [expected]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,finish_reason,expected",
+    [
+        (_COMPLETE_CALL, "stop", "tool_calls"),
+        # a complete call parsed before the cut does not make the cut one whole
+        (_COMPLETE_CALL + "\n" + _CUT_CALL, "length", "length"),
+    ],
+)
+async def test_full_tool_call_cut_by_max_tokens_reports_length(
+    text, finish_reason, expected
+):
+    serving_chat = _hermes_serving_chat()
+    tokenizer = get_tokenizer(MODEL_NAME)
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "test"}],
+        tools=_WEATHER_TOOLS,
+        tool_choice="auto",
+    )
+    response = await serving_chat.chat_completion_full_generator(
+        request=request,
+        result_generator=_outputs(tokenizer, text, finish_reason, stream=False),
+        request_id="test-req",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=tokenizer,
+        request_metadata=RequestResponseMetadata(
+            request_id="test-req", model_name=MODEL_NAME
+        ),
+        parser=serving_chat.parser_cls(
+            tokenizer,
+            request.tools,
+            chat_template_kwargs={},
+            model_config=serving_chat.model_config,
+        ),
+    )
+    assert response.choices[0].finish_reason == expected
