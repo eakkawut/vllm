@@ -2630,3 +2630,28 @@ async def test_full_tool_call_cut_by_max_tokens_reports_length(
         ),
     )
     assert response.choices[0].finish_reason == expected
+
+
+@pytest.mark.parametrize(
+    "requested,clamped,budget,expected",
+    [
+        (32000, 32000, 24000, 24000),  # fits: unchanged
+        (32000, 12000, 24000, 4000),  # long prompt: keep the 8000 answer room
+        (32000, 5000, 24000, 0),  # less room than the reserve: answer only
+        (32000, 12000, None, None),  # no budget
+    ],
+)
+def test_thinking_budget_follows_clamped_max_tokens(
+    requested, clamped, budget, expected
+):
+    """max_tokens is clamped to the context left after the prompt; the
+    thinking budget shrinks with it so the answer room stays."""
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=requested,
+        thinking_token_budget=budget,
+    )
+    params = request.to_sampling_params(clamped, {})
+    assert params.max_tokens == clamped
+    assert params.thinking_token_budget == expected
