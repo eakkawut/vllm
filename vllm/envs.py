@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_B12X_NVFP4_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
+    VLLM_B12X_BLOCKSCALED_MAX_ROWS: int = 0
     VLLM_MXFP8_LM_HEAD: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
@@ -1869,6 +1870,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_B12X_MXFP8_ACTIVATION_MODE", None, ["auto", "a16", "quantized"]
     ),
     # Maximum caller-owned scratch available to one block-scaled GEMM.
+    # Run block-scaled (MXFP8/NVFP4) dense linears over more rows than this as
+    # slices of this many rows (0 = one launch). Lets prefill take larger chunks
+    # for the MoE (each chunk reads every expert once) while the dense GEMMs keep
+    # the row count whose activations stay in L2.
+    "VLLM_B12X_BLOCKSCALED_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_B12X_BLOCKSCALED_MAX_ROWS", "0")
+    ),
     "VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES": lambda: int(
         os.getenv("VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES", "2000000000")
     ),

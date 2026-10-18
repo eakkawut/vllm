@@ -394,6 +394,22 @@ class B12xBlockscaledLinear:
                     activation_global_scale=self.activation_scale,
                 )
             return output
+        rows = source.numel() // self.in_features
+        max_rows = envs.VLLM_B12X_BLOCKSCALED_MAX_ROWS
+        if 0 < max_rows < rows and not torch.cuda.is_current_stream_capturing():
+            source = source.view(rows, self.in_features)
+            output = source.new_empty((rows, self.out_features))
+            for start in range(0, rows, max_rows):
+                api.mm(
+                    source[start : start + max_rows],
+                    self.packed,
+                    plan=plan,
+                    out=output[start : start + max_rows],
+                    bias=bias,
+                    workspace=workspace,
+                    activation_global_scale=self.activation_scale,
+                )
+            return output
         return api.mm(
             source,
             self.packed,
