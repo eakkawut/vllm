@@ -78,6 +78,11 @@ class B12xBlockscaledLinear:
         self.activation_scale = activation_scale
         self.plan = None
         self.a4_plan = None
+        # Callers pass the output buffer: A4 prefill writes A16 and A4 spans into
+        # one tensor, row slicing writes each slice in place.
+        self._provided_output = (
+            self.a4_prefill_enabled or envs.VLLM_B12X_BLOCKSCALED_MAX_ROWS > 0
+        )
         self._a4_prefill_supported = (
             self.a4_prefill_enabled
             and int(packed.padded_in_features) % 128 == 0
@@ -176,7 +181,7 @@ class B12xBlockscaledLinear:
             workspace_nbytes=envs.VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES,
             expected_m=None,
         )
-        if self.a4_prefill_enabled or envs.VLLM_B12X_BLOCKSCALED_MAX_ROWS > 0:
+        if self._provided_output:
             query = replace(query, output_mode="provided")
         self.plan = api.plan_regimes(
             query,
@@ -221,7 +226,7 @@ class B12xBlockscaledLinear:
             )
             output = (
                 source.new_empty((rows, holder.out_features))
-                if holder.a4_prefill_enabled
+                if holder._provided_output
                 else None
             )
 
