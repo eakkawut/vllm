@@ -1923,7 +1923,7 @@ class TestClientErrorResponses:
 
     def test_validation_error_returns_bad_request(self):
         """A pydantic ValidationError during Anthropic->OpenAI conversion is
-        surfaced as a 400 BadRequestError, not a 500."""
+        surfaced as a 400 invalid_request_error, not a 500."""
         handler = MagicMock(spec=AnthropicServingMessages)
         handler.create_messages.side_effect = self._conversion_error()
 
@@ -1934,7 +1934,7 @@ class TestClientErrorResponses:
         assert response.status_code == HTTPStatus.BAD_REQUEST
         body = response.json()
         assert body["type"] == "error"
-        assert body["error"]["type"] == "BadRequestError"
+        assert body["error"]["type"] == "invalid_request_error"
         assert "at most 4 items" in body["error"]["message"]
 
     def test_vllm_client_error_returns_bad_request(self):
@@ -1949,14 +1949,14 @@ class TestClientErrorResponses:
             response = client.post("/v1/messages", json=self._request_body())
 
         assert response.status_code == HTTPStatus.BAD_REQUEST
-        assert response.json()["error"]["type"] == "BadRequestError"
+        assert response.json()["error"]["type"] == "invalid_request_error"
 
     @pytest.mark.parametrize(
         ("input_length", "expected_type", "expected_message"),
         [
             (150, "invalid_request_error", "prompt is too long: 150 tokens > 100"),
             # Fits the context window on its own (e.g. only with max_tokens added).
-            (80, "BadRequestError", "Input length (80)"),
+            (80, "invalid_request_error", "Input length (80)"),
         ],
     )
     def test_prompt_too_long_uses_anthropic_error(
@@ -2044,7 +2044,7 @@ class TestClientErrorResponses:
             )
 
         assert response.status_code == HTTPStatus.BAD_REQUEST
-        assert response.json()["error"]["type"] == "BadRequestError"
+        assert response.json()["error"]["type"] == "invalid_request_error"
 
 
 class TestInlineSystemForSystemFirstTemplates:

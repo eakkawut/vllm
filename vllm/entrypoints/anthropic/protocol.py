@@ -17,6 +17,32 @@ class AnthropicError(BaseModel):
     message: str
 
 
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+    503: "overloaded_error",
+    529: "overloaded_error",
+}
+
+
+def anthropic_error_type(status_code: int) -> str:
+    """Anthropic's error type for an HTTP status.
+
+    Clients such as the Anthropic SDKs and Claude Code read ``error.type``
+    (for instance to retry on ``overloaded_error`` / ``api_error``), so the
+    vLLM/OpenAI type names (``BadRequestError``, ``internal_error``...) must
+    not leak into Anthropic error bodies or stream ``error`` events.
+    """
+    code = int(status_code)
+    if code in _ANTHROPIC_ERROR_TYPES:
+        return _ANTHROPIC_ERROR_TYPES[code]
+    return "invalid_request_error" if 400 <= code < 500 else "api_error"
+
+
 class AnthropicErrorResponse(BaseModel):
     """Error response structure for Anthropic API"""
 

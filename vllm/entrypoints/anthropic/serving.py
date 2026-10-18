@@ -17,6 +17,7 @@ from typing import Any, get_args
 
 import jinja2
 from fastapi import Request
+from pydantic import ValidationError
 
 import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
@@ -39,6 +40,7 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicTool,
     AnthropicToolChangeDefinition,
     AnthropicUsage,
+    anthropic_error_type,
     block_as_text,
 )
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
@@ -225,6 +227,22 @@ def _to_anthropic_stop_reason(
 
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
+
+
+def parse_streaming_error_chunk(data_str: str) -> ErrorResponse | None:
+    """Parse a streaming chunk as an upstream ``ErrorResponse``, if it is one.
+
+    Mid-stream engine failures are delivered to the converter as an
+    ``ErrorResponse`` payload (``{"error": {...}}``) rather than a
+    ``ChatCompletionStreamResponse``. Returning the parsed error lets the
+    converter forward the real upstream message instead of masking it with a
+    schema-validation error (issue #46028). Returns ``None`` for any chunk that
+    is not a well-formed error payload.
+    """
+    try:
+        return ErrorResponse.model_validate_json(data_str)
+    except ValidationError:
+        return None
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -1149,9 +1167,33 @@ class AnthropicServingMessages(OpenAIServingChat):
                         )
                         yield wrap_data_with_event(data, "message_stop")
                     else:
-                        origin_chunk = ChatCompletionStreamResponse.model_validate_json(
-                            data_str
-                        )
+                        try:
+                            origin_chunk = (
+                                ChatCompletionStreamResponse.model_validate_json(
+                                    data_str
+                                )
+                            )
+                        except ValidationError:
+                            # A mid-stream engine failure is delivered as an
+                            # ErrorResponse payload ({"error": {...}}), not a
+                            # ChatCompletionStreamResponse. Forward the upstream
+                            # message instead of letting schema validation mask
+                            # it (issue #46028).
+                            error_payload = parse_streaming_error_chunk(data_str)
+                            if error_payload is None:
+                                raise
+                            error_event = AnthropicStreamEvent(
+                                type="error",
+                                error=AnthropicError(
+                                    type=anthropic_error_type(
+                                        error_payload.error.code
+                                    ),
+                                    message=error_payload.error.message,
+                                ),
+                            )
+                            data = error_event.model_dump_json(exclude_unset=True)
+                            yield wrap_data_with_event(data, "error")
+                            return
 
                         if first_item:
                             chunk = AnthropicStreamEvent(
@@ -1346,7 +1388,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                     error_response = AnthropicStreamEvent(
                         type="error",
                         error=AnthropicError(
-                            type="internal_error",
+                            type="api_error",
                             message="Invalid data format received",
                         ),
                     )
@@ -1358,7 +1400,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             error_response = AnthropicStreamEvent(
                 type="error",
                 error=AnthropicError(
-                    type="internal_error", message=sanitize_message(str(e))
+                    type="api_error", message=sanitize_message(str(e))
                 ),
             )
             data = error_response.model_dump_json(exclude_unset=True)
