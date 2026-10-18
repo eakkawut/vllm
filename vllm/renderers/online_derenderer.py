@@ -55,6 +55,7 @@ class OnlineDerenderer:
         tool_parser: str | None = None,
         reasoning_parser: str | None = None,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        reasoning_effort_map: dict[str, str] | None = None,
         log_error_stack: bool = False,
     ) -> None:
         self.model_config = model_config
@@ -79,6 +80,7 @@ class OnlineDerenderer:
         self.default_chat_template_kwargs: dict[str, Any] = (
             default_chat_template_kwargs or {}
         )
+        self.reasoning_effort_map: dict[str, str] = reasoning_effort_map or {}
         self.trust_request_chat_template = trust_request_chat_template
 
         self.log_error_stack = log_error_stack
@@ -133,6 +135,7 @@ class OnlineDerenderer:
                         chat_request.build_chat_params(
                             self.chat_template,
                             self.chat_template_content_format,
+                            self.reasoning_effort_map,
                         )
                         .with_defaults(self.default_chat_template_kwargs)
                         .chat_template_kwargs

@@ -2299,6 +2299,21 @@ class TestThinkingConfig:
         assert result.reasoning_effort == "low"
         assert result.thinking_token_budget is None
 
+    def test_output_config_effort_follows_reasoning_effort_map(self):
+        """--reasoning-effort-map rewrites Anthropic's output_config.effort
+        too, so a template that only knows low / medium / xhigh renders."""
+        request = _make_request(
+            [{"role": "user", "content": "Hello"}],
+            output_config={"effort": "max"},
+            thinking={"type": "adaptive"},
+        )
+
+        params = _convert(request).build_chat_params(
+            None, "auto", {"high": "medium", "max": "xhigh"}
+        )
+        assert params.chat_template_kwargs["reasoning_effort"] == "xhigh"
+        assert params.chat_template_kwargs["enable_thinking"] is True
+
     def test_disabled_uses_configured_effort(self):
         """Models that always think (GLM-5.3) or reject "none" (Harmony) are
         served with a low effort instead."""

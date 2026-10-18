@@ -63,6 +63,7 @@ async def init_render_app_state(
         tool_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
+        reasoning_effort_map=args.reasoning_effort_map,
         log_error_stack=args.log_error_stack,
         enable_recurrent_instruction_checkpoints=(
             vllm_config.use_request_boundary_checkpoints
@@ -82,6 +83,7 @@ async def init_render_app_state(
         tool_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
+        reasoning_effort_map=args.reasoning_effort_map,
         log_error_stack=args.log_error_stack,
     )
 

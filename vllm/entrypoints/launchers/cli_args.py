@@ -10,7 +10,7 @@ import json
 import ssl
 from collections.abc import Sequence
 from dataclasses import field
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import vllm.envs as envs
 from vllm.config import config
@@ -23,6 +23,7 @@ from vllm.entrypoints.chat_utils import (
     validate_chat_template,
 )
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
+from vllm.renderers import ReasoningEffort
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -99,6 +100,13 @@ class BaseFrontendArgs:
     with request values taking precedence. Useful for setting default
     behavior for reasoning models. Example: '{"enable_thinking": false}'
     to disable thinking mode by default for Qwen3/DeepSeek models."""
+    reasoning_effort_map: dict[str, str] | None = None
+    """JSON mapping that rewrites a request's reasoning effort to a value the
+    chat template supports, for templates that reject or silently fall back on
+    efforts they do not recognize. Applies to the effort set through the Chat
+    Completions, Responses and Anthropic Messages APIs; efforts not listed
+    pass through unchanged. Example: '{"medium": "low", "xhigh": "max"}'
+    for a template that only knows low, high and max."""
     response_role: str = "assistant"
     """The role name to return if `request.add_generation_prompt=true`."""
     return_tokens_as_token_ids: bool = False
@@ -223,6 +231,7 @@ class BaseFrontendArgs:
         """
         # Special case: default_chat_template_kwargs needs json.loads type
         frontend_kwargs["default_chat_template_kwargs"]["type"] = json.loads
+        frontend_kwargs["reasoning_effort_map"]["type"] = json.loads
 
         # Special case: LoRA modules need custom parser action and
         # optional_type(str)
@@ -444,6 +453,25 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     return parser
 
 
+def validate_reasoning_effort_map(effort_map: Any) -> None:
+    if effort_map is None:
+        return
+
+    efforts = get_args(ReasoningEffort)
+    if not isinstance(effort_map, dict) or not all(
+        isinstance(value, str) for value in effort_map.values()
+    ):
+        raise ValueError(
+            "Error: --reasoning-effort-map must be a JSON object mapping "
+            "reasoning efforts to strings."
+        )
+    if unknown := sorted(set(effort_map) - set(efforts)):
+        raise ValueError(
+            f"Error: --reasoning-effort-map has unknown efforts {unknown}; "
+            f"keys must be one of {list(efforts)}."
+        )
+
+
 def validate_parsed_serve_args(args: argparse.Namespace):
     """Quick checks for model serve args that raise prior to loading."""
     # `vllm launch <component>` builds its parser with make_arg_parser too (see
@@ -453,6 +481,8 @@ def validate_parsed_serve_args(args: argparse.Namespace):
 
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
+
+    validate_reasoning_effort_map(getattr(args, "reasoning_effort_map", None))
 
     # Enable auto tool needs a tool call parser to be valid
     if args.enable_auto_tool_choice and not args.tool_call_parser:
