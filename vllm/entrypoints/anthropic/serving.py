@@ -659,10 +659,16 @@ class AnthropicServingMessages(OpenAIServingChat):
             )
 
     @classmethod
-    def _mark_tool_error(cls, tool_text: str, is_error: bool | None) -> str:
+    def _mark_tool_error(
+        cls, content: str | list[dict[str, Any]], is_error: bool | None
+    ) -> str | list[dict[str, Any]]:
         """Prefix a tool result with ``Error:`` when the tool call failed,
         so the model can tell failed tool calls from successful ones."""
-        tool_text = tool_text or ""
+        if isinstance(content, list):
+            if is_error:
+                return [{"type": "text", "text": "Error:"}, *content]
+            return content
+        tool_text = content or ""
         if is_error:
             return f"Error: {tool_text}" if tool_text else "Error"
         return tool_text
@@ -671,53 +677,51 @@ class AnthropicServingMessages(OpenAIServingChat):
     def _convert_user_tool_result(
         cls, block, openai_messages: list[dict[str, Any]]
     ) -> None:
-        """Convert user tool_result with text and image support"""
-        tool_text = ""
-        tool_image_urls: list[str] = []
+        """Convert user tool_result with text and image support.
+
+        Images stay in the tool message that produced them, in order with the
+        text (#58823): a separate user message would sit between the results of
+        parallel tool calls and break their grouping in the chat template.
+        """
+        tool_content: str | list[dict[str, Any]] = ""
         if isinstance(block.content, str):
-            tool_text = block.content
+            tool_content = block.content
         elif isinstance(block.content, list):
-            text_parts: list[str] = []
+            parts: list[dict[str, Any]] = []
             for item in block.content:
                 if not isinstance(item, dict):
                     continue
                 item_type = item.get("type")
                 if item_type == "text":
-                    text_parts.append(item.get("text", ""))
+                    parts.append({"type": "text", "text": item.get("text", "")})
                 elif item_type == "image":
                     source = item.get("source", {})
                     url = cls._convert_image_source_to_url(source)
                     if url:
-                        tool_image_urls.append(url)
+                        parts.append({"type": "image_url", "image_url": {"url": url}})
                 elif item_type in ("document", "search_result"):
-                    text_parts.append(block_as_text(item))
+                    parts.append({"type": "text", "text": block_as_text(item)})
                 elif item_type == "tool_reference":
                     # A tool search result: the named (deferred) tool is now
                     # available. Text in the same tool message, since chat
                     # templates take only text there and one result per call.
                     ref_name = item.get("tool_name") or item.get("name")
                     if ref_name:
-                        text_parts.append(f"[tool reference: {ref_name}]")
-            tool_text = "\n".join(text_parts)
+                        parts.append(
+                            {"type": "text", "text": f"[tool reference: {ref_name}]"}
+                        )
+            if any(p["type"] == "image_url" for p in parts):
+                tool_content = parts
+            else:
+                tool_content = "\n".join(p["text"] for p in parts)
 
         openai_messages.append(
             {
                 "role": "tool",
                 "tool_call_id": block.tool_use_id or "",
-                "content": cls._mark_tool_error(tool_text, block.is_error),
+                "content": cls._mark_tool_error(tool_content, block.is_error),
             }
         )
-
-        if tool_image_urls:
-            openai_messages.append(
-                {
-                    "role": "user",
-                    "content": [  # type: ignore[dict-item]
-                        {"type": "image_url", "image_url": {"url": img}}
-                        for img in tool_image_urls
-                    ],
-                }
-            )
 
     @classmethod
     def _build_base_request(

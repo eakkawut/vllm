@@ -395,7 +395,7 @@ class TestToolResultContent:
         )
 
     def test_tool_result_with_image(self):
-        """Image in tool_result should produce a follow-up user message."""
+        """An image remains in the tool message that produced it."""
         request = self._make_tool_result_request(
             [
                 {
@@ -410,27 +410,22 @@ class TestToolResultContent:
         )
         result = _convert(request)
 
+        assert [m["role"] for m in result.messages] == ["assistant", "tool"]
         tool_msg = [m for m in result.messages if m["role"] == "tool"]
         assert len(tool_msg) == 1
-        assert tool_msg[0]["content"] == ""
-
-        # The image should be injected as a follow-up user message
-        follow_up = [
-            m
-            for m in result.messages
-            if m["role"] == "user" and isinstance(m.get("content"), list)
-        ]
-        assert len(follow_up) == 1
-        img_parts = follow_up[0]["content"]
-        assert len(img_parts) == 1
-        assert img_parts[0] == {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,AAAA"},
+        assert tool_msg[0] == {
+            "role": "tool",
+            "tool_call_id": "call_001",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                }
+            ],
         }
 
     def test_tool_result_with_text_and_image(self):
-        """Mixed text+image tool_result: text in tool msg, image in user
-        msg."""
+        """Mixed text and image content remains in one tool message, in order."""
         request = self._make_tool_result_request(
             [
                 {"type": "text", "text": "Here is the screenshot"},
@@ -442,23 +437,20 @@ class TestToolResultContent:
                         "data": "QUFB",
                     },
                 },
+                {"type": "text", "text": "End of screenshot"},
             ]
         )
         result = _convert(request)
 
-        tool_msg = [m for m in result.messages if m["role"] == "tool"]
-        assert len(tool_msg) == 1
-        assert tool_msg[0]["content"] == "Here is the screenshot"
-
-        follow_up = [
-            m
-            for m in result.messages
-            if m["role"] == "user" and isinstance(m.get("content"), list)
+        assert [m["role"] for m in result.messages] == ["assistant", "tool"]
+        assert result.messages[1]["content"] == [
+            {"type": "text", "text": "Here is the screenshot"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,QUFB"},
+            },
+            {"type": "text", "text": "End of screenshot"},
         ]
-        assert len(follow_up) == 1
-        assert follow_up[0]["content"][0]["image_url"]["url"] == (
-            "data:image/jpeg;base64,QUFB"
-        )
 
     def test_tool_result_with_multiple_images(self):
         request = self._make_tool_result_request(
@@ -482,17 +474,71 @@ class TestToolResultContent:
         )
         result = _convert(request)
 
-        follow_up = [
-            m
-            for m in result.messages
-            if m["role"] == "user" and isinstance(m.get("content"), list)
-        ]
-        assert len(follow_up) == 1
-        urls = [p["image_url"]["url"] for p in follow_up[0]["content"]]
+        assert [m["role"] for m in result.messages] == ["assistant", "tool"]
+        urls = [p["image_url"]["url"] for p in result.messages[1]["content"]]
         assert urls == [
             "data:image/png;base64,IMG1",
             "https://example.com/img2.jpg",
         ]
+
+    def test_parallel_tool_results_with_image_remain_consecutive(self):
+        """An image in the first of two parallel results must not put a user
+        message between the tool messages."""
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+        }
+        request = _make_request(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "A", "name": "Read", "input": {}},
+                        {"type": "tool_use", "id": "B", "name": "Read", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "A", "content": [image]},
+                        {"type": "tool_result", "tool_use_id": "B", "content": "b"},
+                    ],
+                },
+            ]
+        )
+        result = _convert(request)
+
+        assert [m["role"] for m in result.messages] == ["assistant", "tool", "tool"]
+        assert [m["tool_call_id"] for m in result.messages[1:]] == ["A", "B"]
+        assert result.messages[1]["content"][0]["type"] == "image_url"
+        assert result.messages[2]["content"] == "b"
+
+    def test_tool_result_image_with_is_error(self):
+        request = self._make_tool_result_request(
+            [
+                {"type": "text", "text": "crashed"},
+                {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+            ]
+        )
+        request.messages[1].content[0].is_error = True
+        result = _convert(request)
+
+        content = result.messages[1]["content"]
+        assert content[0] == {"type": "text", "text": "Error:"}
+        assert content[1] == {"type": "text", "text": "crashed"}
+        assert content[2]["type"] == "image_url"
+
+    def test_tool_result_invalid_image_keeps_text(self):
+        request = self._make_tool_result_request(
+            [
+                {"type": "text", "text": "still text"},
+                {"type": "image", "source": {"type": "url"}},
+            ]
+        )
+        result = _convert(request)
+
+        assert [m["role"] for m in result.messages] == ["assistant", "tool"]
+        assert result.messages[1]["content"] == "still text"
 
     def test_tool_result_none_content(self):
         request = self._make_tool_result_request(None)
