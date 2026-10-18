@@ -176,7 +176,7 @@ class B12xBlockscaledLinear:
             workspace_nbytes=envs.VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES,
             expected_m=None,
         )
-        if self.a4_prefill_enabled:
+        if self.a4_prefill_enabled or envs.VLLM_B12X_BLOCKSCALED_MAX_ROWS > 0:
             query = replace(query, output_mode="provided")
         self.plan = api.plan_regimes(
             query,
@@ -396,7 +396,7 @@ class B12xBlockscaledLinear:
             return output
         rows = source.numel() // self.in_features
         max_rows = envs.VLLM_B12X_BLOCKSCALED_MAX_ROWS
-        if 0 < max_rows < rows and not torch.cuda.is_current_stream_capturing():
+        if max_rows > 0:
             source = source.view(rows, self.in_features)
             output = source.new_empty((rows, self.out_features))
             for start in range(0, rows, max_rows):
