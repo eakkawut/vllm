@@ -28,7 +28,7 @@ from vllm.entrypoints.chat_utils import (
     parse_chat_messages_async,
 )
 from vllm.exceptions import VLLMValidationError
-from vllm.inputs import EmbedsPrompt
+from vllm.inputs import EmbedsPrompt, TokensPrompt
 from vllm.inputs.engine import MultiModalInput
 from vllm.logger import init_logger
 from vllm.multimodal.hasher import MultiModalHasher
@@ -50,6 +50,7 @@ from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.async_utils import make_async
 from vllm.utils.func_utils import supports_kw
 
+from . import literal_tokens
 from .base import BaseRenderer
 from .inputs.preprocess import parse_dec_only_prompt
 
@@ -63,7 +64,7 @@ if TYPE_CHECKING:
         ChatTemplateContentFormatOption,
         ConversationMessage,
     )
-    from vllm.inputs import MultiModalDataDict, MultiModalUUIDDict, TokensPrompt
+    from vllm.inputs import MultiModalDataDict, MultiModalUUIDDict
     from vllm.inputs.engine import TokensInput
     from vllm.multimodal.processing.processor import (
         MultiModalPromptUpdates,
@@ -1017,6 +1018,34 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         # expose offset_mapping.
         return self.tokenizer is not None and self.tokenizer.is_fast
 
+    def _render_keeping_literals(
+        self,
+        tokenizer: HfTokenizer,
+        conversation: list[ConversationMessage],
+        chat_template_kwargs: dict[str, Any],
+    ) -> TokensPrompt | None:
+        """Render with added-token text in messages and tools kept as text
+        (see `literal_tokens`), or None when there is none (render as usual)."""
+        escaped = literal_tokens.escape(
+            conversation, chat_template_kwargs.get("tools"), tokenizer
+        )
+        if escaped is None:
+            return None
+        escaped_conversation, escaped_tools, literals = escaped
+        kwargs = {**chat_template_kwargs, "tokenize": False}
+        if escaped_tools is not None:
+            kwargs["tools"] = escaped_tools
+        text = safe_apply_chat_template(
+            self.model_config, tokenizer, escaped_conversation, **kwargs
+        )
+        token_ids = literal_tokens.encode(tokenizer, text, literals)
+        if token_ids is None:
+            return None
+        return TokensPrompt(
+            prompt_token_ids=token_ids,
+            prompt=literal_tokens.restore(text, literals),
+        )
+
     def render_messages(
         self,
         messages: list[ChatCompletionMessageParam],
@@ -1065,6 +1094,7 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             chat_template_kwargs["tokenize"] = True
 
         assistant_tokens_mask: list[int] | None = None
+        literal_prompt: TokensPrompt | None = None
         if params.return_assistant_tokens_mask:
             prompt_raw, assistant_tokens_mask = safe_apply_chat_template(
                 model_config,
@@ -1074,12 +1104,19 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 **chat_template_kwargs,
             )
         else:
-            prompt_raw = safe_apply_chat_template(
-                model_config,
-                tokenizer,
-                conversation,
-                **chat_template_kwargs,
-            )
+            if not prompt_embeds_tensors and not self.use_unified_vision_chunk:
+                literal_prompt = self._render_keeping_literals(
+                    tokenizer, conversation, chat_template_kwargs
+                )
+            if literal_prompt is not None:
+                prompt_raw = literal_prompt
+            else:
+                prompt_raw = safe_apply_chat_template(
+                    model_config,
+                    tokenizer,
+                    conversation,
+                    **chat_template_kwargs,
+                )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
         # model which uses unified vision chunks for both images and videos.
@@ -1196,15 +1233,23 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                     **chat_template_kwargs,
                 ),
             )
-            prompt_raw: str | list[int] = result_with_mask[0]
+            prompt_raw: str | list[int] | TokensPrompt = result_with_mask[0]
             assistant_tokens_mask = result_with_mask[1]
         else:
-            prompt_raw = await self._apply_chat_template_async(
-                model_config,
-                tokenizer,
-                conversation,
-                **chat_template_kwargs,
-            )
+            literal_prompt: TokensPrompt | None = None
+            if not prompt_embeds_tensors and not self.use_unified_vision_chunk:
+                literal_prompt = await make_async(
+                    self._render_keeping_literals, executor=self._executor
+                )(tokenizer, conversation, chat_template_kwargs)
+            if literal_prompt is not None:
+                prompt_raw = literal_prompt
+            else:
+                prompt_raw = await self._apply_chat_template_async(
+                    model_config,
+                    tokenizer,
+                    conversation,
+                    **chat_template_kwargs,
+                )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
         # model which uses unified vision chunks for both images and videos.
